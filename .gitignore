@@ -5,6 +5,7 @@ node_modules
 out
 dist
 *.tgz
+.santhosh-local
 
 # code coverage
 coverage

@@ -19,8 +19,5 @@ async function probe(bin: string): Promise<boolean> {
 export async function detectHarness(): Promise<Harness> {
   if (await probe("claude")) return new ClaudeCodeHarness();
   if (await probe("codex")) return new CodexHarness();
-  console.warn(
-    "[santhosh] no coding-agent harness detected — running observe-only",
-  );
   return new ObserveOnlyHarness();
 }

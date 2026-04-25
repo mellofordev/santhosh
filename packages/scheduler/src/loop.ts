@@ -1,6 +1,10 @@
 import type { SanthoshNode } from "../../node/src/node.ts";
 import type { IndexDb } from "../../store/src/index.ts";
-import type { Harness, AgentInput } from "../../harness/src/types.ts";
+import type {
+  AgentInput,
+  AgentMode,
+  Harness,
+} from "../../harness/src/types.ts";
 import type { Header } from "../../protocol/src/types.ts";
 
 export interface SchedulerOptions {
@@ -10,6 +14,24 @@ export interface SchedulerOptions {
   identityPubHex: string;
   intervalMs: number;
   maxHeadersPerTick: number;
+  soloSeedIntervalMs: number;
+  maxSeedsPerTick: number;
+  events?: SchedulerEvents;
+}
+
+export interface TickSummary {
+  mode: AgentMode;
+  peers: number;
+  headers: number;
+  reads: number;
+  seeds: number;
+  note?: string;
+}
+
+export interface SchedulerEvents {
+  onError?: (err: Error) => void;
+  onSeedFailed?: (err: Error) => void;
+  onTick?: (summary: TickSummary) => void;
 }
 
 export class Scheduler {
@@ -34,16 +56,26 @@ export class Scheduler {
     try {
       await this.tick();
     } catch (err) {
-      console.error("[tick] error:", (err as Error).message);
+      this.opts.events?.onError?.(err as Error);
     } finally {
       this.busy = false;
     }
   }
 
   private async tick() {
+    const peerCount = this.opts.node.peerCount();
     const unread = this.opts.index.unreadHeaders(this.opts.maxHeadersPerTick);
-    if (unread.length === 0) {
-      this.opts.index.recordTick(0, 0, 0, "idle");
+    const mode = this.tickMode(peerCount, unread.length);
+    if (mode === "solo-bootstrap" && !this.canSoloSeed()) {
+      this.opts.index.recordTick(0, 0, 0, "solo-bootstrap-throttled");
+      this.opts.events?.onTick?.({
+        mode,
+        peers: peerCount,
+        headers: 0,
+        reads: 0,
+        seeds: 0,
+        note: "solo-bootstrap-throttled",
+      });
       return;
     }
     const newHeaders: Header[] = [];
@@ -56,6 +88,8 @@ export class Scheduler {
       }
     }
     const input: AgentInput = {
+      mode,
+      peerCount,
       newHeaders,
       knownTopics: this.opts.index.knownTopics(),
       recentSeeds: this.opts.index.recentSeeds(this.opts.identityPubHex),
@@ -67,7 +101,7 @@ export class Scheduler {
       if (ok) reads++;
     }
     let seeds = 0;
-    for (const s of decision.seed) {
+    for (const s of decision.seed.slice(0, this.opts.maxSeedsPerTick)) {
       try {
         await this.opts.node.seed({
           topic: s.topic,
@@ -78,13 +112,32 @@ export class Scheduler {
         });
         seeds++;
       } catch (err) {
-        console.warn("[tick] seed failed:", (err as Error).message);
+        this.opts.events?.onSeedFailed?.(err as Error);
       }
     }
     for (const u of unread) this.opts.index.markHeaderRead(u.id);
     this.opts.index.recordTick(unread.length, reads, seeds, decision.reasoning);
-    console.log(
-      `[tick] headers=${unread.length} reads=${reads} seeds=${seeds}`,
-    );
+    this.opts.events?.onTick?.({
+      mode,
+      peers: peerCount,
+      headers: unread.length,
+      reads,
+      seeds,
+      note: decision.reasoning,
+    });
+  }
+
+  private tickMode(peerCount: number, unreadCount: number): AgentMode {
+    if (unreadCount > 0) return "peer-observe";
+    if (peerCount === 0) return "solo-bootstrap";
+    return "network-idle";
+  }
+
+  private canSoloSeed(): boolean {
+    const latest = this.opts.index.latestSeedAt(this.opts.identityPubHex);
+    if (!latest) return true;
+    const latestMs = Date.parse(latest);
+    if (Number.isNaN(latestMs)) return true;
+    return Date.now() - latestMs >= this.opts.soloSeedIntervalMs;
   }
 }

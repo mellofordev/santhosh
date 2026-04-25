@@ -5,6 +5,26 @@ import type { Header, UnitFrontmatter } from "../../protocol/src/types.ts";
 
 export { BlobStore } from "./blobs.ts";
 
+export interface KnowledgeGraphNode {
+  id: string;
+  topic: string;
+  author: string;
+  createdAt: string;
+  summary: string;
+  tags: string[];
+  status: "stored" | "announced";
+}
+
+export interface KnowledgeGraphLink {
+  source: string;
+  target: string;
+}
+
+export interface KnowledgeGraph {
+  nodes: KnowledgeGraphNode[];
+  links: KnowledgeGraphLink[];
+}
+
 export class IndexDb {
   private db: Database;
 
@@ -119,6 +139,15 @@ export class IndexDb {
       .all(author, limit) as { id: string; topic: string }[];
   }
 
+  latestSeedAt(author: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT created_at FROM units WHERE author = ? ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(author) as { created_at: string } | undefined;
+    return row?.created_at ?? null;
+  }
+
   recordTick(newHeaders: number, reads: number, seeds: number, note?: string) {
     this.db
       .prepare(
@@ -137,6 +166,94 @@ export class IndexDb {
 
   countUnits(): number {
     return (this.db.prepare("SELECT COUNT(*) as c FROM units").get() as { c: number }).c;
+  }
+
+  knowledgeGraph(limit = 80): KnowledgeGraph {
+    const nodes = new Map<string, KnowledgeGraphNode>();
+    const links: KnowledgeGraphLink[] = [];
+    const unitRows = this.db
+      .prepare(
+        `SELECT * FROM units ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(limit) as {
+      id: string;
+      topic: string;
+      author: string;
+      created_at: string;
+      parents_json: string;
+      tags_json: string;
+      summary: string;
+    }[];
+
+    for (const row of unitRows) {
+      const parents = parseJsonArray(row.parents_json);
+      nodes.set(row.id, {
+        id: row.id,
+        topic: row.topic,
+        author: row.author,
+        createdAt: row.created_at,
+        summary: row.summary,
+        tags: parseJsonArray(row.tags_json),
+        status: "stored",
+      });
+      for (const parent of parents) links.push({ source: parent, target: row.id });
+    }
+
+    const remaining = Math.max(0, limit - nodes.size);
+    if (remaining > 0) {
+      const headerRows = this.db
+        .prepare(
+          `SELECT id, first_seen, source_peer, header_json FROM headers_seen
+           WHERE header_json IS NOT NULL
+           ORDER BY first_seen DESC LIMIT ?`,
+        )
+        .all(remaining) as {
+        id: string;
+        first_seen: string;
+        source_peer: string | null;
+        header_json: string | null;
+      }[];
+
+      for (const row of headerRows) {
+        if (nodes.has(row.id) || !row.header_json) continue;
+        try {
+          const header = JSON.parse(row.header_json) as Header;
+          nodes.set(header.id, {
+            id: header.id,
+            topic: header.topic,
+            author: header.author || row.source_peer || "unknown",
+            createdAt: header.created_at || row.first_seen,
+            summary: header.summary,
+            tags: header.tags,
+            status: "announced",
+          });
+          for (const parent of header.parents) {
+            links.push({ source: parent, target: header.id });
+          }
+        } catch {
+          // Malformed stored headers are ignored; gossip validation happens elsewhere.
+        }
+      }
+    }
+
+    for (const link of links) {
+      if (!nodes.has(link.source)) {
+        nodes.set(link.source, {
+          id: link.source,
+          topic: "unknown",
+          author: "unknown",
+          createdAt: "",
+          summary: "Parent not stored locally",
+          tags: [],
+          status: "announced",
+        });
+      }
+    }
+
+    return {
+      nodes: [...nodes.values()],
+      links: links.filter((link) => nodes.has(link.source) && nodes.has(link.target)),
+    };
   }
 
   // Lookup full header from units table (for outbound gossip).
@@ -164,5 +281,14 @@ export class IndexDb {
       tags: JSON.parse(row.tags_json),
       summary: row.summary,
     };
+  }
+}
+
+function parseJsonArray(value: string): string[] {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
   }
 }

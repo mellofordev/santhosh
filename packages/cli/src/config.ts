@@ -15,6 +15,20 @@ export interface Config {
   initialTopics: string[];
   tickIntervalMs: number;
   maxHeadersPerTick: number;
+  soloSeedIntervalMs: number;
+  maxSeedsPerTick: number;
+  dashboard: DashboardConfig;
+}
+
+export interface DashboardConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+}
+
+export interface LocalStateStatus {
+  config: boolean;
+  identity: boolean;
 }
 
 export function defaultRoot(): string {
@@ -38,6 +52,13 @@ const DEFAULT_CONFIG: Config = {
   initialTopics: ["santhosh/v1/general"],
   tickIntervalMs: 5 * 60 * 1000,
   maxHeadersPerTick: 20,
+  soloSeedIntervalMs: 60 * 60 * 1000,
+  maxSeedsPerTick: 1,
+  dashboard: {
+    enabled: true,
+    host: "127.0.0.1",
+    port: 8732,
+  },
 };
 
 async function exists(p: string): Promise<boolean> {
@@ -47,6 +68,16 @@ async function exists(p: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+export async function localStateStatus(
+  root = defaultRoot(),
+): Promise<LocalStateStatus> {
+  const p = paths(root);
+  return {
+    config: await exists(p.config),
+    identity: await exists(p.identity),
+  };
 }
 
 export async function ensureRoot(root = defaultRoot()): Promise<void> {

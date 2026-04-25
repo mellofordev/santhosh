@@ -117,7 +117,7 @@ echo -e "    ${bold}exec \$SHELL${reset}                              ${yellow}#
 echo -e "    ${bold}source ${PATCHED_FILES[0]:-~/.zshrc}${reset}"
 echo -e "    ${bold}export PATH=\"$BUN_BIN:\$PATH\"${reset}"
 echo ""
-echo -e "  Then: ${bold}santhosh init${reset} → ${bold}santhosh start${reset}"
+echo -e "  Then: ${bold}santhosh${reset}"
 echo ""
 echo -e "  ${green}New terminals will have santhosh on PATH automatically.${reset}"
 echo ""

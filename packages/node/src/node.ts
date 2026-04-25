@@ -24,10 +24,24 @@ export interface SanthoshNodeOptions extends HostOptions {
   blobs: BlobStore;
   index: IndexDb;
   initialTopics: string[];
+  events?: SanthoshNodeEvents;
+}
+
+export interface PeerInfo {
+  id: string;
+  address?: string;
+  direction?: string;
+}
+
+export interface SanthoshNodeEvents {
+  onHeaderSeen?: (header: Header, topic: string, sourcePeer?: string) => void;
+  onPeerConnected?: (peer: PeerInfo) => void;
+  onPeerDiscovered?: (peer: PeerInfo) => void;
 }
 
 export class SanthoshNode {
   private libp2p!: Libp2p;
+  private dialingPeers = new Set<string>();
   constructor(private opts: SanthoshNodeOptions) {}
 
   get peerId() {
@@ -40,6 +54,15 @@ export class SanthoshNode {
 
   async start(): Promise<void> {
     this.libp2p = await createHost(this.opts);
+    this.libp2p.addEventListener("peer:discovery", (evt: any) => {
+      const peer = evt.detail;
+      const info = peerDiscoveryToPeerInfo(peer);
+      this.opts.events?.onPeerDiscovered?.(info);
+      void this.dialDiscoveredPeer(peer);
+    });
+    this.libp2p.addEventListener("connection:open", (evt: any) => {
+      this.opts.events?.onPeerConnected?.(connectionToPeerInfo(evt.detail));
+    });
     await this.libp2p.handle(
       FETCH_PROTOCOL,
       fetchStreamHandler({
@@ -56,9 +79,15 @@ export class SanthoshNode {
           evt.detail.from?.toString(),
           JSON.stringify(header),
         );
-        if (fresh) console.log(`[gossip] new header ${header.id.slice(0, 12)} on ${topic}`);
-      } catch (err) {
-        console.warn("[gossip] bad header:", err);
+        if (fresh) {
+          this.opts.events?.onHeaderSeen?.(
+            header,
+            topic,
+            evt.detail.from?.toString(),
+          );
+        }
+      } catch {
+        // Ignore malformed gossip payloads; valid headers are stored and surfaced.
       }
     });
     for (const t of this.opts.initialTopics) this.pubsub.subscribe(t);
@@ -75,6 +104,15 @@ export class SanthoshNode {
 
   peerCount(): number {
     return this.libp2p.getPeers().length;
+  }
+
+  connectedPeers(): PeerInfo[] {
+    const byId = new Map<string, PeerInfo>();
+    for (const conn of this.libp2p.getConnections() as any[]) {
+      const peer = connectionToPeerInfo(conn);
+      if (peer.id) byId.set(peer.id, peer);
+    }
+    return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
   }
 
   subscribedTopics(): string[] {
@@ -124,4 +162,39 @@ export class SanthoshNode {
   onConnect(cb: (c: Connection) => void) {
     this.libp2p.addEventListener("connection:open", (e: any) => cb(e.detail));
   }
+
+  private async dialDiscoveredPeer(peer: any): Promise<void> {
+    const peerId = peer.id ?? peer.peerId;
+    const key = peerId?.toString() ?? peer.multiaddrs?.[0]?.toString();
+    if (!key || key === this.peerId || this.dialingPeers.has(key)) return;
+    if (this.libp2p.getPeers().some((p) => p.toString() === key)) return;
+
+    this.dialingPeers.add(key);
+    try {
+      if (peer.multiaddrs?.length) {
+        await this.libp2p.dial(peer.multiaddrs);
+      } else if (peerId) {
+        await this.libp2p.dial(peerId);
+      }
+    } catch {
+      // Discovery is best-effort; failed peers can be rediscovered later.
+    } finally {
+      this.dialingPeers.delete(key);
+    }
+  }
+}
+
+function connectionToPeerInfo(conn: any): PeerInfo {
+  return {
+    id: (conn.remotePeer ?? conn.remotePeerId ?? "").toString(),
+    address: conn.remoteAddr?.toString(),
+    direction: conn.direction,
+  };
+}
+
+function peerDiscoveryToPeerInfo(peer: any): PeerInfo {
+  return {
+    id: (peer.id ?? peer.peerId ?? peer).toString(),
+    address: peer.multiaddrs?.[0]?.toString(),
+  };
 }

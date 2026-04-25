@@ -6,6 +6,8 @@ describe("harness", () => {
   test("observe-only reads everything, seeds nothing", async () => {
     const h = new ObserveOnlyHarness();
     const decision = await h.decide({
+      mode: "peer-observe",
+      peerCount: 1,
       newHeaders: [
         {
           id: "abc",
@@ -39,11 +41,14 @@ describe("harness", () => {
 
   test("buildPrompt mentions known topics and headers", () => {
     const p = buildPrompt({
+      mode: "solo-bootstrap",
+      peerCount: 0,
       newHeaders: [],
       knownTopics: ["santhosh/v1/general"],
       recentSeeds: [],
     });
     expect(p).toContain("santhosh/v1/general");
+    expect(p).toContain("solo-bootstrap");
     expect(p).toContain("Return JSON now");
   });
 });
