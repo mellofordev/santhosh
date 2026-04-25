@@ -38,29 +38,37 @@ fi
 
 # ── 3. install santhosh ───────────────────────────────────────────────────────
 header "Installing santhosh..."
-# Force a clean install: bun caches git deps and may skip re-installing if
-# the same SHA is already present, which leaves a broken state if a previous
-# install failed mid-way.
-rm -rf "$HOME/.bun/install/global/node_modules/santhosh" 2>/dev/null || true
-bun add -g "github:${REPO}"
 
-# Verify the binary actually got linked.
+# Force bun to re-resolve master HEAD on every install. Bun caches the
+# resolved git SHA for `github:user/repo` URLs, so without #master users
+# can end up reinstalling a stale (sometimes broken) older commit.
+rm -rf "$HOME/.bun/install/global/node_modules/santhosh" 2>/dev/null || true
+rm -rf "$HOME"/.bun/install/cache/@GH@mellofordev-santhosh-* 2>/dev/null || true
+
+bun add -g "github:${REPO}#master"
+
+# Verify the binary actually got linked. If not, fall back to a manual symlink
+# straight to the TS entry — bun runs .ts natively, no build needed.
+PKG_DIR="$HOME/.bun/install/global/node_modules/santhosh"
+TS_BIN="$PKG_DIR/packages/cli/src/index.ts"
+
 if [ ! -e "$BUN_BIN/santhosh" ]; then
-  warning "santhosh binary not found at $BUN_BIN/santhosh — installing dependencies in the package directory and re-linking..."
-  PKG_DIR="$HOME/.bun/install/global/node_modules/santhosh"
-  if [ -d "$PKG_DIR" ]; then
-    (cd "$PKG_DIR" && bun install --production --no-save 2>/dev/null || bun install)
-    # Re-create symlink manually (bin entry → packages/cli/src/index.ts)
+  warning "Bun did not link santhosh (the published package's bin target may be missing)."
+  if [ -f "$TS_BIN" ]; then
+    info "Creating symlink manually: $BUN_BIN/santhosh → $TS_BIN"
     mkdir -p "$BUN_BIN"
-    ln -sf "$PKG_DIR/packages/cli/src/index.ts" "$BUN_BIN/santhosh"
-    chmod +x "$PKG_DIR/packages/cli/src/index.ts" 2>/dev/null || true
+    ln -sf "$TS_BIN" "$BUN_BIN/santhosh"
+    chmod +x "$TS_BIN" 2>/dev/null || true
+  else
+    warning "Source file $TS_BIN does not exist — install is broken. Aborting."
+    exit 1
   fi
 fi
 
 if [ -e "$BUN_BIN/santhosh" ]; then
-  info "santhosh installed at $BUN_BIN/santhosh"
+  info "santhosh installed at $BUN_BIN/santhosh → $(readlink "$BUN_BIN/santhosh" 2>/dev/null || echo '(file)')"
 else
-  warning "santhosh binary still missing — check the output above for errors"
+  warning "santhosh binary still missing — see errors above"
   exit 1
 fi
 
@@ -112,4 +120,14 @@ echo ""
 echo -e "  Then: ${bold}santhosh init${reset} → ${bold}santhosh start${reset}"
 echo ""
 echo -e "  ${green}New terminals will have santhosh on PATH automatically.${reset}"
+echo ""
+
+# ── 6. self-test ──────────────────────────────────────────────────────────────
+echo -e "  ${bold}Quick self-test:${reset}"
+if PATH="$BUN_BIN:$PATH" command -v santhosh >/dev/null 2>&1; then
+  PATH="$BUN_BIN:$PATH" santhosh --help 2>&1 | head -1 | sed "s/^/    /"
+  info "self-test passed"
+else
+  warning "santhosh still not on PATH within this script — check $BUN_BIN/santhosh manually"
+fi
 echo ""
