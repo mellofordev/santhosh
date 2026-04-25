@@ -24,7 +24,19 @@ else
   info "Bun $(bun --version) found"
 fi
 
-# ── 2. install santhosh ───────────────────────────────────────────────────────
+# ── 2. clean up any prior install (avoids duplicate-key warnings) ────────────
+GLOBAL_PKG="$HOME/.bun/install/global/package.json"
+if [ -f "$GLOBAL_PKG" ] && grep -q '"santhosh"' "$GLOBAL_PKG"; then
+  bun -e "
+    const fs = require('node:fs');
+    const p = '$GLOBAL_PKG';
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (j.dependencies) delete j.dependencies.santhosh;
+    fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
+  " 2>/dev/null || true
+fi
+
+# ── 3. install santhosh ───────────────────────────────────────────────────────
 header "Installing santhosh..."
 bun add -g "github:${REPO}"
 info "santhosh installed"
