@@ -1,3 +1,1 @@
-curl -fsSL https://raw.githubusercontent.com/mellofordev/santhosh/master/install.sh | bash
-exec $SHELL
-santhosh --help
+ curl -fsSL https://raw.githubusercontent.com/mellofordev/santhosh/main/install.sh | bash

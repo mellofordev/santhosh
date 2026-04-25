@@ -3,6 +3,8 @@ set -euo pipefail
 
 REPO="mellofordev/santhosh"
 BUN_BIN="$HOME/.bun/bin"
+INSTALL_ROOT="$HOME/.santhosh"
+SOURCE_DIR="$INSTALL_ROOT/source"
 
 # ── colours ──────────────────────────────────────────────────────────────────
 bold='\033[1m'
@@ -24,55 +26,50 @@ else
   info "Bun $(bun --version) found"
 fi
 
-# ── 2. clean up any prior install (avoids duplicate-key warnings) ────────────
-GLOBAL_PKG="$HOME/.bun/install/global/package.json"
-if [ -f "$GLOBAL_PKG" ] && grep -q '"santhosh"' "$GLOBAL_PKG"; then
-  bun -e "
-    const fs = require('node:fs');
-    const p = '$GLOBAL_PKG';
-    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
-    if (j.dependencies) delete j.dependencies.santhosh;
-    fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');
-  " 2>/dev/null || true
-fi
-
-# ── 3. install santhosh ───────────────────────────────────────────────────────
+# ── 2. install santhosh source ────────────────────────────────────────────────
 header "Installing santhosh..."
 
-# Force bun to re-resolve master HEAD on every install. Bun caches the
-# resolved git SHA for `github:user/repo` URLs, so without #master users
-# can end up reinstalling a stale (sometimes broken) older commit.
-rm -rf "$HOME/.bun/install/global/node_modules/santhosh" 2>/dev/null || true
-rm -rf "$HOME"/.bun/install/cache/@GH@mellofordev-santhosh-* 2>/dev/null || true
+TMP_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
 
-bun add -g "github:${REPO}#master"
+mkdir -p "$INSTALL_ROOT" "$BUN_BIN"
 
-# Verify the binary actually got linked. If not, fall back to a manual symlink
-# straight to the TS entry — bun runs .ts natively, no build needed.
-PKG_DIR="$HOME/.bun/install/global/node_modules/santhosh"
-TS_BIN="$PKG_DIR/packages/cli/src/index.ts"
+curl -fsSL "https://github.com/${REPO}/archive/refs/heads/master.tar.gz" -o "$TMP_DIR/santhosh.tar.gz"
+tar -xzf "$TMP_DIR/santhosh.tar.gz" -C "$TMP_DIR"
+rm -rf "$SOURCE_DIR"
+mv "$TMP_DIR/santhosh-master" "$SOURCE_DIR"
 
-if [ ! -e "$BUN_BIN/santhosh" ]; then
-  warning "Bun did not link santhosh (the published package's bin target may be missing)."
-  if [ -f "$TS_BIN" ]; then
-    info "Creating symlink manually: $BUN_BIN/santhosh → $TS_BIN"
-    mkdir -p "$BUN_BIN"
-    ln -sf "$TS_BIN" "$BUN_BIN/santhosh"
-    chmod +x "$TS_BIN" 2>/dev/null || true
-  else
-    warning "Source file $TS_BIN does not exist — install is broken. Aborting."
-    exit 1
-  fi
-fi
+(
+  cd "$SOURCE_DIR"
+  bun install
+)
 
-if [ -e "$BUN_BIN/santhosh" ]; then
-  info "santhosh installed at $BUN_BIN/santhosh → $(readlink "$BUN_BIN/santhosh" 2>/dev/null || echo '(file)')"
-else
-  warning "santhosh binary still missing — see errors above"
+if [ ! -f "$SOURCE_DIR/packages/cli/src/index.ts" ]; then
+  warning "Downloaded source is missing packages/cli/src/index.ts. Aborting."
   exit 1
 fi
 
-# ── 4. add bun bin to PATH in the user's shell rc ────────────────────────────
+cat > "$BUN_BIN/santhosh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$SOURCE_DIR"
+BUN_EXE="\$(command -v bun || true)"
+if [ -z "\$BUN_EXE" ]; then
+  BUN_EXE="$BUN_BIN/bun"
+fi
+exec "\$BUN_EXE" run packages/cli/src/index.ts "\$@"
+EOF
+chmod +x "$BUN_BIN/santhosh"
+info "santhosh installed at $BUN_BIN/santhosh"
+
+# Remove a stale Bun global package symlink if one points at the broken
+# github package layout. The wrapper above is now the source of truth.
+rm -rf "$HOME/.bun/install/global/node_modules/santhosh" 2>/dev/null || true
+
+# ── 3. add bun bin to PATH in the user's shell rc ────────────────────────────
 PATCHED_FILES=()
 
 add_to_path() {
@@ -107,7 +104,7 @@ case "$SHELL_NAME" in
     ;;
 esac
 
-# ── 5. done ───────────────────────────────────────────────────────────────────
+# ── 4. done ───────────────────────────────────────────────────────────────────
 header "Done!"
 echo ""
 echo -e "  Your shell config is set up. To use ${bold}santhosh${reset} ${bold}right now${reset} in this terminal,"
@@ -122,7 +119,7 @@ echo ""
 echo -e "  ${green}New terminals will have santhosh on PATH automatically.${reset}"
 echo ""
 
-# ── 6. self-test ──────────────────────────────────────────────────────────────
+# ── 5. self-test ──────────────────────────────────────────────────────────────
 echo -e "  ${bold}Quick self-test:${reset}"
 if PATH="$BUN_BIN:$PATH" command -v santhosh >/dev/null 2>&1; then
   PATH="$BUN_BIN:$PATH" santhosh --help 2>&1 | head -1 | sed "s/^/    /"
