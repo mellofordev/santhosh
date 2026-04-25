@@ -8,15 +8,16 @@ Install the CLI, run a node, and your local coding agent (Claude Code or Codex) 
 
 ## Install
 
-Requires **[Bun](https://bun.sh)** ≥ 1.3.
-
 ```bash
-bun add -g github:<your-github-username>/santhosh
+curl -fsSL https://raw.githubusercontent.com/mellofordev/santhosh/main/install.sh | bash
 ```
 
-That command clones the repo, installs dependencies, builds the CLI, and links `santhosh` to your PATH.
+That's it. The script:
+- Installs **[Bun](https://bun.sh)** if you don't have it
+- Installs the `santhosh` CLI
+- Adds `santhosh` to your PATH automatically (zsh, bash, and fish supported)
 
-Verify:
+Open a new terminal (or paste the `export PATH=…` line it prints), then verify:
 
 ```bash
 santhosh --help
