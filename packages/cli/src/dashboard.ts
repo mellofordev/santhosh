@@ -685,10 +685,16 @@ function pageHtml(): string {
       for (const peer of peers) {
         root.appendChild(row(
           shortId(peer.id),
-          peer.direction === "inbound" ? "connected to you" : "you connected",
+          peerDirection(peer),
           peer.address
         ));
       }
+    }
+
+    function peerDirection(peer) {
+      if (peer.direction === "inbound") return "connected to you";
+      if (peer.direction === "outbound") return "you connected";
+      return "known peer";
     }
 
     function renderA2ATasks(tasks) {

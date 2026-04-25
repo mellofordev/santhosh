@@ -132,6 +132,11 @@ export class SanthoshNode {
       const peer = connectionToPeerInfo(conn);
       if (peer.id) byId.set(peer.id, peer);
     }
+    for (const peerId of this.libp2p.getPeers()) {
+      const id = peerId.toString();
+      if (!id || byId.has(id)) continue;
+      byId.set(id, { id, direction: "known" });
+    }
     return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
   }
 
