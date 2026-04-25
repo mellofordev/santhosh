@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { A2AArtifact, A2AMessage, A2ATask } from "../../protocol/src/a2a.ts";
 import type { Header, UnitFrontmatter } from "../../protocol/src/types.ts";
 
 export { BlobStore } from "./blobs.ts";
@@ -23,6 +24,16 @@ export interface KnowledgeGraphLink {
 export interface KnowledgeGraph {
   nodes: KnowledgeGraphNode[];
   links: KnowledgeGraphLink[];
+}
+
+export interface A2ATaskRecord {
+  id: string;
+  contextId: string;
+  state: string;
+  peerId: string | null;
+  goal: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export class IndexDb {
@@ -68,6 +79,35 @@ export class IndexDb {
         seeds INTEGER NOT NULL,
         note TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS a2a_tasks (
+        id TEXT PRIMARY KEY,
+        context_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        peer_id TEXT,
+        goal TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS a2a_messages (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        message_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_a2a_messages_task ON a2a_messages(task_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS a2a_artifacts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        artifact_json TEXT NOT NULL,
+        unit_id TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_a2a_artifacts_task ON a2a_artifacts(task_id, created_at);
     `);
   }
 
@@ -139,6 +179,14 @@ export class IndexDb {
       .all(author, limit) as { id: string; topic: string }[];
   }
 
+  recentUnits(limit = 20): { id: string; topic: string }[] {
+    return this.db
+      .prepare(
+        `SELECT id, topic FROM units ORDER BY created_at DESC LIMIT ?`,
+      )
+      .all(limit) as { id: string; topic: string }[];
+  }
+
   latestSeedAt(author: string): string | null {
     const row = this.db
       .prepare(
@@ -166,6 +214,152 @@ export class IndexDb {
 
   countUnits(): number {
     return (this.db.prepare("SELECT COUNT(*) as c FROM units").get() as { c: number }).c;
+  }
+
+  countOwnUnits(author: string): number {
+    return (
+      this.db
+        .prepare("SELECT COUNT(*) as c FROM units WHERE author = ?")
+        .get(author) as { c: number }
+    ).c;
+  }
+
+  upsertA2ATask(task: A2ATask, peerId?: string | null): void {
+    const now = new Date().toISOString();
+    const goal = summarizeA2ATask(task);
+    const existing = this.db
+      .prepare("SELECT created_at FROM a2a_tasks WHERE id = ?")
+      .get(task.id) as { created_at: string } | undefined;
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO a2a_tasks
+         (id, context_id, state, peer_id, goal, created_at, updated_at, metadata_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        task.id,
+        task.contextId,
+        task.status.state,
+        peerId ?? null,
+        goal,
+        existing?.created_at ?? now,
+        now,
+        JSON.stringify(task.metadata ?? {}),
+      );
+  }
+
+  recordA2AMessage(taskId: string, message: A2AMessage): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO a2a_messages
+         (id, task_id, role, message_json, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        message.messageId,
+        taskId,
+        message.role,
+        JSON.stringify(message),
+        new Date().toISOString(),
+      );
+  }
+
+  recordA2AArtifact(taskId: string, artifact: A2AArtifact, unitId?: string): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO a2a_artifacts
+         (id, task_id, artifact_json, unit_id, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        artifact.artifactId,
+        taskId,
+        JSON.stringify(artifact),
+        unitId ?? null,
+        new Date().toISOString(),
+      );
+  }
+
+  recordA2ATaskSnapshot(task: A2ATask, peerId?: string | null): void {
+    this.upsertA2ATask(task, peerId);
+    for (const message of task.history ?? []) {
+      this.recordA2AMessage(task.id, message);
+    }
+    for (const artifact of task.artifacts ?? []) {
+      const unitId =
+        typeof artifact.metadata?.santhoshUnitId === "string"
+          ? artifact.metadata.santhoshUnitId
+          : undefined;
+      this.recordA2AArtifact(task.id, artifact, unitId);
+    }
+  }
+
+  getA2ATask(id: string, historyLength = 20): A2ATask | null {
+    const task = this.db
+      .prepare("SELECT * FROM a2a_tasks WHERE id = ?")
+      .get(id) as
+      | {
+          id: string;
+          context_id: string;
+          state: string;
+          metadata_json: string | null;
+        }
+      | undefined;
+    if (!task) return null;
+    const messages = this.db
+      .prepare(
+        `SELECT message_json FROM a2a_messages
+         WHERE task_id = ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(id, historyLength) as { message_json: string }[];
+    const artifacts = this.db
+      .prepare(
+        `SELECT artifact_json FROM a2a_artifacts
+         WHERE task_id = ?
+         ORDER BY created_at ASC`,
+      )
+      .all(id) as { artifact_json: string }[];
+    return {
+      kind: "task",
+      id: task.id,
+      contextId: task.context_id,
+      status: { state: task.state as A2ATask["status"]["state"] },
+      history: messages
+        .reverse()
+        .map((row) => JSON.parse(row.message_json) as A2AMessage),
+      artifacts: artifacts.map((row) => JSON.parse(row.artifact_json) as A2AArtifact),
+      metadata: task.metadata_json ? JSON.parse(task.metadata_json) : {},
+    };
+  }
+
+  listA2ATasks(limit = 20): A2ATaskRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, context_id, state, peer_id, goal, created_at, updated_at
+         FROM a2a_tasks
+         ORDER BY updated_at DESC
+         LIMIT ?`,
+      )
+      .all(limit) as {
+      id: string;
+      context_id: string;
+      state: string;
+      peer_id: string | null;
+      goal: string;
+      created_at: string;
+      updated_at: string;
+    }[];
+    return rows.map((row) => ({
+      id: row.id,
+      contextId: row.context_id,
+      state: row.state,
+      peerId: row.peer_id,
+      goal: row.goal,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
   }
 
   knowledgeGraph(limit = 80): KnowledgeGraph {
@@ -291,4 +485,15 @@ function parseJsonArray(value: string): string[] {
   } catch {
     return [];
   }
+}
+
+function summarizeA2ATask(task: A2ATask): string {
+  const firstText = task.history
+    ?.flatMap((message) => message.parts)
+    .find((part) => part.kind === "text")?.text;
+  if (firstText) return firstText.slice(0, 180);
+  const artifactText = task.artifacts
+    ?.flatMap((artifact) => artifact.parts)
+    .find((part) => part.kind === "text")?.text;
+  return artifactText ? artifactText.slice(0, 180) : "A2A task";
 }

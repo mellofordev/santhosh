@@ -38,6 +38,7 @@ describe("scheduler", () => {
     const index = await IndexDb.open(join(dir, "i.db"));
     const id = await generateIdentity();
     const seenInputs: AgentInput[] = [];
+    const seeds: any[] = [];
     let tick: any = null;
     const scheduler = new Scheduler(
       schedulerOpts({
@@ -45,8 +46,12 @@ describe("scheduler", () => {
         identityPubHex: id.publicKeyHex,
         node: {
           peerCount: () => 0,
+          connectedPeers: () => [],
+          announceStoredUnits: async () => 0,
           readById: async () => false,
-          seed: async () => undefined,
+          seed: async (draft: any) => {
+            seeds.push(draft);
+          },
         },
         decide: async (input) => {
           seenInputs.push(input);
@@ -64,6 +69,8 @@ describe("scheduler", () => {
     expect(input.mode).toBe("solo-bootstrap");
     expect(input.peerCount).toBe(0);
     expect(tick?.mode).toBe("solo-bootstrap");
+    expect(seeds[0]?.tags).toContain("starter");
+    expect(tick?.seeds).toBe(1);
   });
 
   test("unread headers put scheduler in peer-observe mode", async () => {
@@ -91,6 +98,8 @@ describe("scheduler", () => {
         identityPubHex: id.publicKeyHex,
         node: {
           peerCount: () => 1,
+          connectedPeers: () => [],
+          announceStoredUnits: async () => 0,
           readById: async (hash: string) => {
             readIds.push(hash);
             return true;
@@ -109,6 +118,47 @@ describe("scheduler", () => {
     const input = seenInputs[0]!;
     expect(input.mode).toBe("peer-observe");
     expect(input.newHeaders.map((h: Header) => h.id)).toEqual([header.id]);
+    expect(readIds).toEqual([header.id]);
+  });
+
+  test("scheduler reads observed headers even when harness skips them", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "santhosh-scheduler-"));
+    const index = await IndexDb.open(join(dir, "i.db"));
+    const id = await generateIdentity();
+    const unit = await signUnit(
+      {
+        topic: "santhosh/v1/general",
+        parents: [],
+        tags: ["test"],
+        summary: "test header",
+        body: "body",
+      },
+      id,
+    );
+    const header: Header = toHeader(unit.frontmatter);
+    index.recordHeaderSeen(header.id, "peerA", JSON.stringify(header));
+
+    const readIds: string[] = [];
+    const scheduler = new Scheduler(
+      schedulerOpts({
+        index,
+        identityPubHex: id.publicKeyHex,
+        node: {
+          peerCount: () => 1,
+          connectedPeers: () => [],
+          announceStoredUnits: async () => 0,
+          readById: async (hash: string) => {
+            readIds.push(hash);
+            return true;
+          },
+          seed: async () => undefined,
+        },
+        decide: async () => ({ read: [], seed: [] }),
+      }),
+    );
+
+    await (scheduler as any).tick();
+
     expect(readIds).toEqual([header.id]);
   });
 });

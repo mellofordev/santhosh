@@ -66,8 +66,9 @@ function printTick(summary: {
   headers: number;
   reads: number;
   seeds: number;
+  a2a?: number;
 }): void {
-  if (summary.headers === 0 && summary.reads === 0 && summary.seeds === 0) {
+  if (summary.headers === 0 && summary.reads === 0 && summary.seeds === 0 && (summary.a2a ?? 0) === 0) {
     if (summary.mode === "network-idle") return;
     if (summary.mode === "solo-bootstrap") {
       console.log("\nAgent checked for starter knowledge. Nothing shared yet.");
@@ -84,6 +85,9 @@ function printTick(summary: {
   }
   if (summary.seeds > 0) {
     parts.push(`shared ${summary.seeds} knowledge item${summary.seeds === 1 ? "" : "s"}`);
+  }
+  if ((summary.a2a ?? 0) > 0) {
+    parts.push(`completed ${summary.a2a} A2A exchange${summary.a2a === 1 ? "" : "s"}`);
   }
 
   console.log(`\nAgent update: ${parts.join(", ")}.`);
@@ -124,6 +128,7 @@ async function startDaemon(): Promise<void> {
           dashboard?.update((state) => {
             state.peers = peers;
             state.graph = index.knowledgeGraph();
+            state.a2aTasks = index.listA2ATasks();
           });
           dashboard?.record(peerEvent(peers));
         }
@@ -135,6 +140,18 @@ async function startDaemon(): Promise<void> {
         dashboard?.record(headerEvent(header, sourcePeer));
         dashboard?.update((state) => {
           state.graph = index.knowledgeGraph();
+          state.a2aTasks = index.listA2ATasks();
+        });
+      },
+      onA2ATask: (task, sourcePeer) => {
+        dashboard?.record({
+          type: "agent",
+          title: "P2P A2A task handled",
+          detail: `${task.status.state} from ${shortId(sourcePeer ?? "local")}`,
+        });
+        dashboard?.update((state) => {
+          state.graph = index.knowledgeGraph();
+          state.a2aTasks = index.listA2ATasks();
         });
       },
     },
@@ -180,6 +197,7 @@ async function startDaemon(): Promise<void> {
           state.lastTick = summary;
           state.peers = node.connectedPeers();
           state.graph = index.knowledgeGraph();
+          state.a2aTasks = index.listA2ATasks();
         });
         const event = tickEvent(summary);
         if (event) dashboard?.record(event);
@@ -204,6 +222,7 @@ async function startDaemon(): Promise<void> {
       lastTick: null,
       events: [],
       graph: index.knowledgeGraph(),
+      a2aTasks: index.listA2ATasks(),
     };
     try {
       dashboard = startDashboard({
@@ -211,6 +230,30 @@ async function startDaemon(): Promise<void> {
         port: cfg.dashboard.port,
         state: dashboardState,
         loadMarkdown: (hash) => blobs.get(hash),
+        getA2ATask: (taskId, historyLength) =>
+          index.getA2ATask(taskId, historyLength),
+        handleA2AMessage: async (params) => {
+          const response = await node.handleA2ARequest(
+            {
+              jsonrpc: "2.0",
+              id: crypto.randomUUID(),
+              method: "message/send",
+              params,
+            },
+            "local-a2a-client",
+          );
+          if ("error" in response) throw new Error(response.error.message);
+          dashboard?.update((state) => {
+            state.graph = index.knowledgeGraph();
+            state.a2aTasks = index.listA2ATasks();
+          });
+          dashboard?.record({
+            type: "agent",
+            title: "A2A task completed",
+            detail: "Stored and announced markdown memory artifact.",
+          });
+          return response.result as any;
+        },
       });
       dashboard.record({
         type: "system",

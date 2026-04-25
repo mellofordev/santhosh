@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BlobStore, IndexDb } from "../packages/store/src/index.ts";
 import { generateIdentity, signUnit, serialize } from "../packages/protocol/src/index.ts";
+import type { A2ATask } from "../packages/protocol/src/a2a.ts";
 
 describe("store", () => {
   test("blob put/get roundtrip", async () => {
@@ -97,5 +98,46 @@ describe("store", () => {
       source: child.frontmatter.id,
       target: "announced",
     });
+  });
+
+  test("index stores A2A tasks, messages, and artifacts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "santhosh-db-"));
+    const db = await IndexDb.open(join(dir, "i.db"));
+    const task: A2ATask = {
+      kind: "task",
+      id: "task-1",
+      contextId: "ctx-1",
+      status: { state: "completed" },
+      history: [
+        {
+          kind: "message",
+          role: "user",
+          messageId: "msg-1",
+          parts: [{ kind: "text", text: "Remember this installer fix" }],
+        },
+      ],
+      artifacts: [
+        {
+          artifactId: "artifact-1",
+          name: "memory",
+          parts: [{ kind: "text", text: "# Memory" }],
+        },
+      ],
+    };
+
+    db.upsertA2ATask(task, "peer-1");
+    db.recordA2AMessage(task.id, task.history![0]!);
+    db.recordA2AArtifact(task.id, task.artifacts![0]!, "unit-1");
+
+    expect(db.listA2ATasks()[0]).toMatchObject({
+      id: "task-1",
+      contextId: "ctx-1",
+      state: "completed",
+      peerId: "peer-1",
+      goal: "Remember this installer fix",
+    });
+    const stored = db.getA2ATask("task-1");
+    expect(stored?.history?.[0]?.messageId).toBe("msg-1");
+    expect(stored?.artifacts?.[0]?.artifactId).toBe("artifact-1");
   });
 });

@@ -44,6 +44,43 @@ Dashboard: http://127.0.0.1:8732
 
 The dashboard shows a live knowledge map. Click a stored knowledge node to read the markdown message that an agent created or fetched.
 
+It also exposes a local A2A-compatible endpoint:
+
+```txt
+GET  http://127.0.0.1:8732/.well-known/agent-card.json
+POST http://127.0.0.1:8732/a2a
+```
+
+Minimal A2A `message/send` test:
+
+```bash
+curl -s http://127.0.0.1:8732/a2a \
+  -H 'content-type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "role": "user",
+        "messageId": "local-test-1",
+        "parts": [{ "kind": "text", "text": "Remember this useful local test memory." }]
+      }
+    }
+  }'
+```
+
+The response is an A2A task. Santhosh also signs and gossips the message as a markdown memory artifact.
+
+When multiple Santhosh nodes are connected, the scheduler also sends A2A `message/send` requests over libp2p using:
+
+```txt
+/santhosh/a2a/1.0.0
+```
+
+The remote node handles the A2A request, creates a signed markdown memory artifact, and gossips the resulting header back to the network.
+
 ---
 
 ## Commands
@@ -147,6 +184,25 @@ bun run dev            # run from source
 bun run local          # isolated local run with dashboard on http://127.0.0.1:8732
 bun test               # unit + store + harness tests
 bunx tsc --noEmit      # type check
+```
+
+Two local nodes:
+
+```bash
+SANTHOSH_HOME=/tmp/santhosh-A SANTHOSH_DASHBOARD_PORT=8732 bun run local
+```
+
+```bash
+SANTHOSH_HOME=/tmp/santhosh-B SANTHOSH_DASHBOARD_PORT=8733 bun run local
+```
+
+If mDNS does not connect them, copy one of node A's printed multiaddrs into node B:
+
+```bash
+SANTHOSH_HOME=/tmp/santhosh-B \
+SANTHOSH_DASHBOARD_PORT=8733 \
+SANTHOSH_BOOTSTRAP='/ip4/127.0.0.1/tcp/<port>/p2p/<peer-id>' \
+bun run local
 ```
 
 See [TESTING.md](TESTING.md) for the full local P2P test walkthrough.

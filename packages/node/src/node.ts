@@ -3,17 +3,30 @@ import type { Connection } from "@libp2p/interface";
 import { createHost, type HostOptions } from "./host.ts";
 import { BlobStore, IndexDb } from "../../store/src/index.ts";
 import {
+  A2A_PROTOCOL,
   FETCH_PROTOCOL,
   TOPIC_PREFIX,
+  a2aStreamHandler,
   decodeHeader,
   encodeHeader,
   fetchBlob,
   fetchStreamHandler,
+  isA2AMessage,
+  jsonRpcError,
+  jsonRpcSuccess,
   parse as parseUnit,
+  sendA2ARequest,
   serialize as serializeUnit,
   signUnit,
+  textFromA2AMessage,
   toHeader,
   verifyUnit,
+  type A2AArtifact,
+  type A2AJsonRpcRequest,
+  type A2AJsonRpcResponse,
+  type A2AMessage,
+  type A2AMessageSendParams,
+  type A2ATask,
   type Header,
   type Identity,
   type UnseededUnit,
@@ -37,6 +50,7 @@ export interface SanthoshNodeEvents {
   onHeaderSeen?: (header: Header, topic: string, sourcePeer?: string) => void;
   onPeerConnected?: (peer: PeerInfo) => void;
   onPeerDiscovered?: (peer: PeerInfo) => void;
+  onA2ATask?: (task: A2ATask, sourcePeer?: string) => void;
 }
 
 export class SanthoshNode {
@@ -67,6 +81,12 @@ export class SanthoshNode {
       FETCH_PROTOCOL,
       fetchStreamHandler({
         loadBlob: (hash) => this.opts.blobs.get(hash),
+      }),
+    );
+    await this.libp2p.handle(
+      A2A_PROTOCOL,
+      a2aStreamHandler({
+        handleRequest: (req) => this.handleA2ARequest(req, "p2p"),
       }),
     );
     this.pubsub.addEventListener("message", (evt: any) => {
@@ -159,6 +179,67 @@ export class SanthoshNode {
     return false;
   }
 
+  async announceStoredUnits(limit = 20): Promise<number> {
+    let announced = 0;
+    for (const unitRef of this.opts.index.recentUnits(limit)) {
+      const md = await this.opts.blobs.get(unitRef.id);
+      if (!md) continue;
+      try {
+        const unit = parseUnit(md);
+        const ok = await verifyUnit(unit);
+        if (!ok) continue;
+        const header = toHeader(unit.frontmatter);
+        if (!this.subscribedTopics().includes(header.topic)) {
+          this.pubsub.subscribe(header.topic);
+        }
+        await this.pubsub.publish(header.topic, encodeHeader(header));
+        announced++;
+      } catch {
+        continue;
+      }
+    }
+    return announced;
+  }
+
+  async sendA2AToPeer(
+    peerId: string,
+    req: A2AJsonRpcRequest,
+  ): Promise<A2AJsonRpcResponse> {
+    const peer = this.libp2p
+      .getPeers()
+      .find((p) => p.toString() === peerId);
+    if (!peer) throw new Error(`peer not connected: ${peerId}`);
+    const stream = await this.libp2p.dialProtocol(peer, A2A_PROTOCOL);
+    return await sendA2ARequest(stream, req);
+  }
+
+  async handleA2ARequest(
+    req: A2AJsonRpcRequest,
+    peerId?: string,
+  ): Promise<A2AJsonRpcResponse> {
+    if (!req || req.jsonrpc !== "2.0" || typeof req.method !== "string") {
+      return jsonRpcError(req?.id, -32600, "Invalid JSON-RPC request");
+    }
+    if (req.method === "message/send") {
+      const params = req.params as Partial<A2AMessageSendParams> | undefined;
+      if (!params || !isA2AMessage(params.message)) {
+        return jsonRpcError(req.id, -32602, "Expected params.message with text parts");
+      }
+      const task = await this.captureA2AMessage(params as A2AMessageSendParams, peerId);
+      return jsonRpcSuccess(req.id, task);
+    }
+    if (req.method === "tasks/get") {
+      const params = req.params as { id?: unknown; historyLength?: number } | undefined;
+      if (!params || typeof params.id !== "string") {
+        return jsonRpcError(req.id, -32602, "Expected params.id");
+      }
+      const task = this.opts.index.getA2ATask(params.id, params.historyLength);
+      if (!task) return jsonRpcError(req.id, -32001, "Task not found");
+      return jsonRpcSuccess(req.id, task);
+    }
+    return jsonRpcError(req.id, -32601, `Unsupported A2A method: ${req.method}`);
+  }
+
   onConnect(cb: (c: Connection) => void) {
     this.libp2p.addEventListener("connection:open", (e: any) => cb(e.detail));
   }
@@ -176,11 +257,89 @@ export class SanthoshNode {
       } else if (peerId) {
         await this.libp2p.dial(peerId);
       }
+      this.opts.events?.onPeerConnected?.(peerDiscoveryToPeerInfo(peer));
     } catch {
       // Discovery is best-effort; failed peers can be rediscovered later.
     } finally {
       this.dialingPeers.delete(key);
     }
+  }
+
+  private async captureA2AMessage(
+    params: A2AMessageSendParams,
+    peerId?: string,
+  ): Promise<A2ATask> {
+    const taskId = params.message.taskId ?? crypto.randomUUID();
+    const contextId = params.message.contextId ?? crypto.randomUUID();
+    const receivedText = textFromA2AMessage(params.message);
+    const markdown = [
+      "# A2A Memory",
+      "",
+      receivedText || "(empty message)",
+      "",
+      "## Metadata",
+      "",
+      `- A2A task: ${taskId}`,
+      `- A2A message: ${params.message.messageId}`,
+      `- Received from: ${peerId ?? "local-a2a-client"}`,
+      `- Received: ${new Date().toISOString()}`,
+    ].join("\n");
+    const summary =
+      receivedText.split(/\s+/).slice(0, 16).join(" ") || "A2A memory";
+    const header = await this.seed({
+      topic: this.opts.initialTopics[0] ?? "santhosh/v1/general",
+      parents: [],
+      tags: ["a2a", "memory"],
+      summary: summary.length > 120 ? `${summary.slice(0, 117)}...` : summary,
+      body: markdown,
+    });
+    const artifact: A2AArtifact = {
+      artifactId: header.id,
+      name: "Signed Santhosh memory",
+      description: "Markdown memory artifact published on the Santhosh P2P network.",
+      parts: [{ kind: "text", text: markdown }],
+      metadata: {
+        santhoshUnitId: header.id,
+        topic: header.topic,
+      },
+    };
+    const response: A2AMessage = {
+      kind: "message",
+      role: "agent",
+      messageId: crypto.randomUUID(),
+      taskId,
+      contextId,
+      parts: [
+        {
+          kind: "text",
+          text: `Stored and announced memory artifact ${header.id}.`,
+        },
+      ],
+      metadata: {
+        santhoshUnitId: header.id,
+      },
+    };
+    const task: A2ATask = {
+      kind: "task",
+      id: taskId,
+      contextId,
+      status: {
+        state: "completed",
+        message: response,
+        timestamp: new Date().toISOString(),
+      },
+      history: [params.message, response],
+      artifacts: [artifact],
+      metadata: {
+        santhoshUnitId: header.id,
+      },
+    };
+    this.opts.index.upsertA2ATask(task, peerId ?? "local-a2a-client");
+    this.opts.index.recordA2AMessage(taskId, params.message);
+    this.opts.index.recordA2AMessage(taskId, response);
+    this.opts.index.recordA2AArtifact(taskId, artifact, header.id);
+    this.opts.events?.onA2ATask?.(task, peerId);
+    return task;
   }
 }
 

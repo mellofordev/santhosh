@@ -1,13 +1,26 @@
 import type { PeerInfo } from "../../node/src/node.ts";
+import {
+  A2A_VERSION,
+  isA2AMessage,
+  jsonRpcError,
+  jsonRpcSuccess,
+  type A2AAgentCard,
+  type A2AJsonRpcRequest,
+  type A2AMessageSendParams,
+  type A2ATask,
+  type A2ATaskQueryParams,
+} from "../../protocol/src/a2a.ts";
 import type { Header } from "../../protocol/src/types.ts";
 import type { TickSummary } from "../../scheduler/src/loop.ts";
-import type { KnowledgeGraph } from "../../store/src/index.ts";
+import type { A2ATaskRecord, KnowledgeGraph } from "../../store/src/index.ts";
 
 export interface DashboardOptions {
   host: string;
   port: number;
   state: DashboardState;
   loadMarkdown?: (id: string) => Promise<string | null>;
+  getA2ATask?: (id: string, historyLength?: number) => A2ATask | null;
+  handleA2AMessage?: (params: A2AMessageSendParams) => Promise<A2ATask>;
 }
 
 export interface DashboardState {
@@ -22,6 +35,7 @@ export interface DashboardState {
   lastTick: TickSummary | null;
   events: DashboardEvent[];
   graph: KnowledgeGraph;
+  a2aTasks: A2ATaskRecord[];
 }
 
 export interface DashboardEvent {
@@ -46,14 +60,18 @@ export function startDashboard(opts: DashboardOptions): DashboardServer {
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
 
   function snapshot(): DashboardState {
+    const graph = opts.state.graph ?? { nodes: [], links: [] };
     return {
       ...opts.state,
-      peers: [...opts.state.peers],
-      events: [...opts.state.events],
+      topics: [...(opts.state.topics ?? [])],
+      listenAddrs: [...(opts.state.listenAddrs ?? [])],
+      peers: [...(opts.state.peers ?? [])],
+      events: [...(opts.state.events ?? [])],
       graph: {
-        nodes: [...opts.state.graph.nodes],
-        links: [...opts.state.graph.links],
+        nodes: [...(graph.nodes ?? [])],
+        links: [...(graph.links ?? [])],
       },
+      a2aTasks: [...(opts.state.a2aTasks ?? [])],
     };
   }
 
@@ -85,6 +103,17 @@ export function startDashboard(opts: DashboardOptions): DashboardServer {
       }
       if (url.pathname === "/api/status") {
         return Response.json(snapshot());
+      }
+      if (url.pathname === "/.well-known/agent-card.json" || url.pathname === "/agent-card.json") {
+        return Response.json(agentCard(url.origin, opts.state));
+      }
+      if (url.pathname === "/a2a") {
+        if (req.method !== "POST") {
+          return new Response("Method not allowed", { status: 405 });
+        }
+        const rpc = (await req.json().catch(() => null)) as A2AJsonRpcRequest | null;
+        const response = await handleA2ARpc(rpc, opts);
+        return Response.json(response);
       }
       if (url.pathname.startsWith("/api/units/")) {
         const id = decodeURIComponent(url.pathname.slice("/api/units/".length));
@@ -143,6 +172,82 @@ export function startDashboard(opts: DashboardOptions): DashboardServer {
   };
 }
 
+function agentCard(origin: string, state: DashboardState): A2AAgentCard {
+  return {
+    protocolVersion: A2A_VERSION,
+    name: "Santhosh local memory agent",
+    description:
+      "A local A2A endpoint that turns agent messages into signed Santhosh memory artifacts.",
+    url: `${origin}/a2a`,
+    version: "0.1.0",
+    capabilities: {
+      streaming: false,
+      pushNotifications: false,
+      stateTransitionHistory: true,
+    },
+    defaultInputModes: ["text/plain", "text/markdown"],
+    defaultOutputModes: ["text/markdown"],
+    provider: {
+      organization: "Santhosh",
+    },
+    skills: [
+      {
+        id: "memory.capture",
+        name: "Capture memory",
+        description:
+          "Accepts an A2A text message, stores it as a task, and emits a signed markdown memory artifact on the Santhosh network.",
+        tags: ["memory", "p2p", "markdown"],
+        examples: [
+          "Remember this install failure and the fix.",
+          "Share a useful observation with nearby agents.",
+        ],
+        inputModes: ["text/plain", "text/markdown"],
+        outputModes: ["text/markdown"],
+      },
+      {
+        id: "memory.inspect",
+        name: "Inspect local memory",
+        description: "Returns stored A2A tasks and memory artifacts through tasks/get.",
+        tags: ["memory", "tasks"],
+        inputModes: ["text/plain"],
+        outputModes: ["text/markdown"],
+      },
+    ],
+    // Non-standard metadata is intentionally omitted; peer identity is visible
+    // through normal Santhosh status endpoints.
+  };
+}
+
+async function handleA2ARpc(
+  rpc: A2AJsonRpcRequest | null,
+  opts: DashboardOptions,
+) {
+  if (!rpc || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string") {
+    return jsonRpcError(null, -32600, "Invalid JSON-RPC request");
+  }
+  if (rpc.method === "message/send") {
+    if (!opts.handleA2AMessage) {
+      return jsonRpcError(rpc.id, -32601, "A2A message handling is unavailable");
+    }
+    const params = rpc.params as Partial<A2AMessageSendParams> | undefined;
+    if (!params || !isA2AMessage(params.message)) {
+      return jsonRpcError(rpc.id, -32602, "Expected params.message with text parts");
+    }
+    const task = await opts.handleA2AMessage(params as A2AMessageSendParams);
+    return jsonRpcSuccess(rpc.id, task);
+  }
+  if (rpc.method === "tasks/get") {
+    const params = rpc.params as Partial<A2ATaskQueryParams> | undefined;
+    if (!params || typeof params.id !== "string") {
+      return jsonRpcError(rpc.id, -32602, "Expected params.id");
+    }
+    const task = opts.getA2ATask?.(params.id, params.historyLength);
+    if (!task) return jsonRpcError(rpc.id, -32001, "Task not found");
+    return jsonRpcSuccess(rpc.id, task);
+  }
+  return jsonRpcError(rpc.id, -32601, `Unsupported A2A method: ${rpc.method}`);
+}
+
 export function headerEvent(header: Header, sourcePeer?: string): Omit<DashboardEvent, "id" | "ts"> {
   return {
     type: "knowledge",
@@ -172,6 +277,7 @@ export function tickEvent(summary: TickSummary): Omit<DashboardEvent, "id" | "ts
   if (summary.headers > 0) parts.push(`reviewed ${summary.headers} announcement${summary.headers === 1 ? "" : "s"}`);
   if (summary.reads > 0) parts.push(`saved ${summary.reads} item${summary.reads === 1 ? "" : "s"}`);
   if (summary.seeds > 0) parts.push(`shared ${summary.seeds} item${summary.seeds === 1 ? "" : "s"}`);
+  if (summary.a2a > 0) parts.push(`completed ${summary.a2a} A2A exchange${summary.a2a === 1 ? "" : "s"}`);
   return {
     type: "agent",
     title: "Agent activity",
@@ -252,25 +358,25 @@ function pageHtml(): string {
     .status.offline { color: var(--danger); }
     .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
     .metric {
-      min-height: 112px;
+      min-height: 88px;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 16px;
       box-shadow: var(--shadow);
     }
-    .metric strong { display: block; margin-top: 18px; font-size: 1.75rem; line-height: 1.1; font-weight: 750; overflow-wrap: anywhere; }
-    .map-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 12px; margin-bottom: 12px; align-items: stretch; }
+    .metric strong { display: block; margin-top: 10px; font-size: 1.55rem; line-height: 1.1; font-weight: 750; overflow-wrap: anywhere; }
+    .map-layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 12px; margin-bottom: 12px; align-items: stretch; }
     .map-panel {
       position: relative;
-      min-height: 520px;
+      min-height: 440px;
       background: var(--map-bg);
       border: 1px solid #2b3531;
       border-radius: 8px;
       overflow: hidden;
       box-shadow: var(--shadow);
     }
-    .map-panel canvas { display: block; width: 100%; height: 520px; }
+    .map-panel canvas { display: block; width: 100%; height: 440px; }
     .map-overlay {
       position: absolute;
       left: 16px;
@@ -292,6 +398,34 @@ function pageHtml(): string {
     .insight-item { border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; background: var(--panel-2); }
     .insight-item strong { display: block; line-height: 1.25; }
     .insight-item span { display: block; margin-top: 4px; color: var(--muted); font-size: 0.86rem; }
+    .composer { display: grid; gap: 10px; margin-top: 12px; }
+    .composer textarea {
+      width: 100%;
+      min-height: 92px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 11px;
+      font: inherit;
+      line-height: 1.4;
+      color: var(--ink);
+      background: #fbfcfb;
+    }
+    .actions { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+    button {
+      min-height: 34px;
+      border: 1px solid #165c42;
+      border-radius: 8px;
+      padding: 7px 11px;
+      background: var(--accent);
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.05); }
+    button:disabled { cursor: not-allowed; opacity: 0.55; }
+    .hint { color: var(--muted); font-size: 0.82rem; line-height: 1.35; }
     .reader {
       margin-top: 12px;
       border-top: 1px solid var(--line);
@@ -318,7 +452,7 @@ function pageHtml(): string {
     .markdown code { background: #e6eee9; border-radius: 5px; padding: 1px 4px; }
     .markdown pre code { background: transparent; padding: 0; color: inherit; }
     .markdown blockquote { margin: 10px 0; padding-left: 12px; border-left: 3px solid var(--line); color: var(--muted); }
-    .layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(340px, 0.85fr); gap: 12px; align-items: start; }
+    .layout { display: grid; grid-template-columns: minmax(0, 0.92fr) minmax(420px, 1.08fr); gap: 12px; align-items: start; }
     .stack { display: grid; gap: 12px; }
     .panel {
       background: var(--panel);
@@ -333,9 +467,11 @@ function pageHtml(): string {
     .field span, .row span, .event span { display: block; color: var(--muted); font-size: 0.82rem; line-height: 1.35; margin-bottom: 4px; }
     .list { display: grid; gap: 8px; }
     .row { border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; background: var(--panel-2); min-width: 0; }
+    button.row { width: 100%; display: block; text-align: left; color: var(--ink); background: var(--panel-2); font-weight: 400; cursor: pointer; }
+    button.row:hover, button.row.selected { border-color: #9ab7aa; background: #e8f0ec; filter: none; }
     .row strong { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88rem; line-height: 1.35; overflow-wrap: anywhere; }
     .row em { display: block; margin-top: 3px; color: var(--muted); font-style: normal; font-size: 0.88rem; }
-    .events { display: grid; gap: 8px; max-height: 624px; overflow: auto; padding-right: 2px; }
+    .events { display: grid; gap: 8px; max-height: 720px; overflow: auto; padding-right: 2px; }
     .event { border: 1px solid var(--line); border-left: 4px solid var(--accent); background: var(--panel); border-radius: 8px; padding: 11px 12px; }
     .event.agent { border-left-color: var(--warn); }
     .event.system { border-left-color: var(--accent-2); }
@@ -344,14 +480,22 @@ function pageHtml(): string {
     .event strong { display: block; line-height: 1.3; }
     .event p { margin-top: 5px; color: #33403b; overflow-wrap: anywhere; }
     .empty { color: var(--muted); }
+    details {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 12px 14px;
+      box-shadow: var(--shadow);
+    }
+    summary { cursor: pointer; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
     @media (max-width: 820px) {
       main { width: min(100vw - 20px, 720px); margin: 18px auto; }
       header, .layout { grid-template-columns: 1fr; }
       header { align-items: start; }
       .metrics, .meta-grid { grid-template-columns: 1fr; }
       .map-layout { grid-template-columns: 1fr; }
-      .map-panel { min-height: 440px; }
-      .map-panel canvas { height: 440px; }
+      .map-panel { min-height: 380px; }
+      .map-panel canvas { height: 380px; }
       .map-overlay { display: block; }
       .legend { justify-content: flex-start; margin-top: 10px; }
       .metric { min-height: 96px; }
@@ -381,11 +525,19 @@ function pageHtml(): string {
             <span><i class="swatch" style="--c:#79be8a"></i>stored</span>
             <span><i class="swatch" style="--c:#d89455"></i>announced</span>
             <span><i class="swatch" style="--c:#8ea0ff"></i>peer</span>
+            <span><i class="swatch" style="--c:#c58cff"></i>A2A task</span>
           </div>
         </div>
       </div>
       <aside class="insight">
-        <h2>What to watch</h2>
+        <h2>A2A Control</h2>
+        <form class="composer" id="a2aForm">
+          <textarea id="a2aText" placeholder="Send a memory through local A2A, then gossip it to peers."></textarea>
+          <div class="actions">
+            <button id="a2aSend" type="submit">Send A2A</button>
+            <span class="hint" id="a2aFormStatus">Local message/send</span>
+          </div>
+        </form>
         <div class="insight-list" id="insights"></div>
         <div class="reader" id="reader">
           <h3>Select a knowledge node</h3>
@@ -408,21 +560,22 @@ function pageHtml(): string {
           <div id="peers" class="list"></div>
         </div>
         <div class="panel">
-          <div class="panel-head"><h2>Node</h2></div>
-          <div class="meta-grid">
+          <div class="panel-head"><h2>A2A Tasks</h2><span class="empty">message/send</span></div>
+          <div id="a2aTasks" class="list"></div>
+        </div>
+        <details>
+          <summary>Node details</summary>
+          <div class="meta-grid" style="margin-top:12px">
             <div class="field"><span>Peer ID</span><code id="peerId">-</code></div>
             <div class="field"><span>Home</span><code id="home">-</code></div>
             <div class="field"><span>Topics</span><code id="topics">-</code></div>
             <div class="field"><span>Checks</span><code id="checks">-</code></div>
           </div>
-        </div>
-        <div class="panel">
-          <div class="panel-head"><h2>Addresses</h2></div>
-          <div id="addresses" class="list"></div>
-        </div>
+          <div class="list" id="addresses" style="margin-top:10px"></div>
+        </details>
       </div>
       <div class="panel">
-        <div class="panel-head"><h2>Live Activity</h2><span class="empty" id="lastTick">No tick yet</span></div>
+        <div class="panel-head"><h2>Realtime Messages</h2><span class="empty" id="lastTick">No tick yet</span></div>
         <div id="events" class="events"></div>
       </div>
     </section>
@@ -435,6 +588,9 @@ function pageHtml(): string {
     let lastState = null;
     let mapFrame = 0;
     let mapHitTargets = [];
+    let selectedUnitId = null;
+    let selectedTaskId = null;
+    let hoverUnitId = null;
 
     function setConnection(text, kind) {
       const el = $("connection");
@@ -454,7 +610,28 @@ function pageHtml(): string {
       return el;
     }
 
+    function normalizeState(state) {
+      return {
+        home: state?.home ?? "-",
+        peerId: state?.peerId ?? "-",
+        agent: state?.agent ?? "-",
+        topics: Array.isArray(state?.topics) ? state.topics : [],
+        listenAddrs: Array.isArray(state?.listenAddrs) ? state.listenAddrs : [],
+        discovery: state?.discovery ?? "unknown",
+        checksEverySeconds: state?.checksEverySeconds ?? 0,
+        peers: Array.isArray(state?.peers) ? state.peers : [],
+        lastTick: state?.lastTick ?? null,
+        events: Array.isArray(state?.events) ? state.events : [],
+        graph: {
+          nodes: Array.isArray(state?.graph?.nodes) ? state.graph.nodes : [],
+          links: Array.isArray(state?.graph?.links) ? state.graph.links : [],
+        },
+        a2aTasks: Array.isArray(state?.a2aTasks) ? state.a2aTasks : [],
+      };
+    }
+
     function render(state) {
+      state = normalizeState(state);
       lastState = state;
       setConnection("Live", "live");
       $("peerCount").textContent = state.peers.length;
@@ -467,10 +644,11 @@ function pageHtml(): string {
       $("checks").textContent = "every " + state.checksEverySeconds + "s, " + state.discovery;
       $("discovery").textContent = state.discovery;
       $("lastTick").textContent = state.lastTick
-        ? state.lastTick.headers + " headers, " + state.lastTick.reads + " reads, " + state.lastTick.seeds + " seeds"
+        ? state.lastTick.headers + " headers, " + state.lastTick.reads + " reads, " + state.lastTick.seeds + " seeds, " + (state.lastTick.a2a ?? 0) + " A2A"
         : "No tick yet";
 
       renderPeers(state.peers);
+      renderA2ATasks(state.a2aTasks);
       renderAddresses(state.listenAddrs);
       renderEvents(state.events);
       renderInsights(state);
@@ -484,7 +662,7 @@ function pageHtml(): string {
       const announced = state.graph.nodes.filter((n) => n.status === "announced").length;
       root.appendChild(insight("Knowledge", stored + " stored, " + announced + " announced"));
       root.appendChild(insight("Network", state.peers.length ? state.peers.length + " connected peer" + (state.peers.length === 1 ? "" : "s") : "No peers connected yet"));
-      root.appendChild(insight("Agent", state.lastTick ? state.lastTick.mode : "Waiting for first tick"));
+      root.appendChild(insight("P2P A2A", state.lastTick ? ((state.lastTick.a2a ?? 0) + " peer exchange" + ((state.lastTick.a2a ?? 0) === 1 ? "" : "s") + " last tick") : "Waiting for first tick"));
       const latest = state.graph.nodes[0];
       if (latest) root.appendChild(insight("Latest node", latest.summary || shortId(latest.id)));
     }
@@ -513,6 +691,22 @@ function pageHtml(): string {
       }
     }
 
+    function renderA2ATasks(tasks) {
+      const root = $("a2aTasks");
+      clear(root);
+      if (!tasks || tasks.length === 0) {
+        root.appendChild(row("No A2A tasks yet", "POST JSON-RPC message/send to /a2a to create one."));
+        return;
+      }
+      for (const task of tasks) {
+        const item = row(task.goal || task.id, task.state + " · " + shortId(task.id), task.peerId || "", "button");
+        item.type = "button";
+        item.classList.toggle("selected", task.id === selectedTaskId);
+        item.addEventListener("click", () => showTask(task.id));
+        root.appendChild(item);
+      }
+    }
+
     function renderAddresses(addresses) {
       const root = $("addresses");
       clear(root);
@@ -533,8 +727,8 @@ function pageHtml(): string {
       for (const event of events) root.appendChild(eventCard(event));
     }
 
-    function row(primary, secondary, tertiary) {
-      const el = document.createElement("div");
+    function row(primary, secondary, tertiary, tag = "div") {
+      const el = document.createElement(tag);
       el.className = "row";
       el.appendChild(textEl("strong", primary));
       if (secondary) el.appendChild(textEl("em", secondary));
@@ -546,9 +740,16 @@ function pageHtml(): string {
       const el = document.createElement("div");
       el.className = "event " + event.type;
       el.appendChild(textEl("span", time(event.ts)));
-      el.appendChild(textEl("strong", event.title));
+      el.appendChild(textEl("strong", eventTitle(event)));
       if (event.detail) el.appendChild(textEl("p", event.detail));
       return el;
+    }
+
+    function eventTitle(event) {
+      if (event.title === "Knowledge announced") return "Memory announced";
+      if (event.title === "P2P A2A task handled") return "Peer message handled";
+      if (event.title === "A2A task completed") return "Local message stored";
+      return event.title;
     }
 
     function scheduleGraph(state) {
@@ -570,7 +771,7 @@ function pageHtml(): string {
       drawMapBackground(ctx, w, h);
 
       const graph = buildMapGraph(state, w, h);
-      $("mapSummary").textContent = graph.knowledgeCount + " knowledge nodes, " + state.peers.length + " peers, " + graph.parentLinks + " parent links";
+      $("mapSummary").textContent = graph.knowledgeCount + " knowledge nodes, " + state.a2aTasks.length + " A2A tasks, " + state.peers.length + " peers";
       if (graph.nodes.length === 1) {
         drawEmptyMap(ctx, w, h);
       }
@@ -605,6 +806,21 @@ function pageHtml(): string {
           r: 7,
         });
         links.push({ source: center.id, target: peerNode.id, kind: "peer" });
+      });
+
+      const tasks = (state.a2aTasks || []).slice(0, 24);
+      tasks.forEach((task, i) => {
+        const angle = -Math.PI / 3 + (i - (tasks.length - 1) / 2) * 0.22;
+        const taskNode = addNode({
+          id: "task:" + task.id,
+          label: task.goal || shortId(task.id),
+          kind: "task",
+          rawTask: task,
+          x: center.x + Math.cos(angle) * Math.min(w, h) * 0.36,
+          y: center.y + Math.sin(angle) * Math.min(w, h) * 0.32,
+          r: 6,
+        });
+        links.push({ source: center.id, target: taskNode.id, kind: "a2a" });
       });
 
       const knowledge = state.graph.nodes.slice(0, 72);
@@ -750,25 +966,27 @@ function pageHtml(): string {
         peer: "#8ea0ff",
         stored: "#79be8a",
         announced: "#d89455",
+        task: "#c58cff",
       };
       for (const node of nodes) {
         ctx.beginPath();
         ctx.arc(node.x, node.y, node.r + 5, 0, Math.PI * 2);
-        ctx.fillStyle = hexToRgba(palette[node.kind] || "#d89455", 0.12);
+        const active = node.id === selectedUnitId || node.id === hoverUnitId;
+        ctx.fillStyle = hexToRgba(palette[node.kind] || "#d89455", active ? 0.26 : 0.12);
         ctx.fill();
         ctx.beginPath();
-        ctx.arc(node.x, node.y, node.r, 0, Math.PI * 2);
+        ctx.arc(node.x, node.y, active ? node.r + 2 : node.r, 0, Math.PI * 2);
         ctx.fillStyle = palette[node.kind] || "#d89455";
         ctx.fill();
         ctx.strokeStyle = "rgba(255,255,255,0.55)";
-        ctx.lineWidth = node.kind === "local" ? 2 : 1;
+        ctx.lineWidth = active || node.kind === "local" ? 2 : 1;
         ctx.stroke();
       }
       ctx.font = "11px system-ui, sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
       for (const node of nodes) {
-        const label = node.kind === "stored" || node.kind === "announced" ? compactLabel(node.label) : node.label;
+        const label = node.kind === "stored" || node.kind === "announced" || node.kind === "task" ? compactLabel(node.label) : node.label;
         ctx.fillStyle = node.kind === "local" ? "#eef5f0" : "rgba(238,245,240,0.8)";
         ctx.fillText(label, node.x, node.y + node.r + 8, 148);
       }
@@ -793,8 +1011,30 @@ function pageHtml(): string {
       const x = evt.clientX - rect.left;
       const y = evt.clientY - rect.top;
       const hit = [...mapHitTargets].reverse().find((node) => Math.hypot(node.x - x, node.y - y) <= node.r + 10);
-      if (!hit || !hit.raw) return;
+      if (!hit || (!hit.raw && !hit.rawTask)) return;
+      if (hit.rawTask) {
+        await showTask(hit.rawTask.id);
+        return;
+      }
+      selectedUnitId = hit.id;
+      selectedTaskId = null;
+      if (lastState) renderA2ATasks(lastState.a2aTasks);
+      if (lastState) scheduleGraph(lastState);
       await showUnit(hit.raw);
+    }
+
+    function hoverMapNode(evt) {
+      const canvas = $("knowledgeMap");
+      const rect = canvas.getBoundingClientRect();
+      const x = evt.clientX - rect.left;
+      const y = evt.clientY - rect.top;
+      const hit = [...mapHitTargets].reverse().find((node) => Math.hypot(node.x - x, node.y - y) <= node.r + 10);
+      const next = hit?.raw || hit?.rawTask ? hit.id : null;
+      canvas.style.cursor = hit?.raw || hit?.rawTask ? "pointer" : "default";
+      if (next !== hoverUnitId) {
+        hoverUnitId = next;
+        if (lastState) scheduleGraph(lastState);
+      }
     }
 
     async function showUnit(node) {
@@ -823,10 +1063,111 @@ function pageHtml(): string {
       }
     }
 
+    async function showTask(taskId) {
+      selectedTaskId = taskId;
+      selectedUnitId = null;
+      if (lastState) {
+        renderA2ATasks(lastState.a2aTasks);
+        scheduleGraph(lastState);
+      }
+      const reader = $("reader");
+      clear(reader);
+      reader.appendChild(textEl("h3", "Loading A2A task"));
+      reader.appendChild(textEl("p", shortId(taskId), "reader-meta"));
+      try {
+        const res = await fetch("/a2a", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "ui-task-" + Date.now(),
+            method: "tasks/get",
+            params: { id: taskId, historyLength: 20 },
+          }),
+        });
+        const rpc = await res.json();
+        if (rpc.error) throw new Error(rpc.error.message);
+        renderTask(rpc.result);
+      } catch (err) {
+        clear(reader);
+        reader.appendChild(textEl("h3", "Task unavailable"));
+        reader.appendChild(textEl("p", err.message || "Unable to load task", "reader-meta"));
+      }
+    }
+
+    function renderTask(task) {
+      const reader = $("reader");
+      clear(reader);
+      reader.appendChild(textEl("h3", "A2A Task " + shortId(task.id)));
+      reader.appendChild(textEl("p", task.status.state + " · " + task.contextId, "reader-meta"));
+      const body = document.createElement("div");
+      body.className = "markdown";
+      if (task.history?.length) {
+        body.appendChild(textEl("h3", "Messages"));
+        for (const msg of task.history) {
+          body.appendChild(textEl("p", msg.role + ": " + partsText(msg.parts)));
+        }
+      }
+      if (task.artifacts?.length) {
+        body.appendChild(textEl("h3", "Artifacts"));
+        for (const artifact of task.artifacts) {
+          body.appendChild(textEl("p", (artifact.name || artifact.artifactId) + ": " + partsText(artifact.parts)));
+        }
+      }
+      reader.appendChild(body);
+    }
+
+    function partsText(parts) {
+      return (parts || []).filter((part) => part.kind === "text").map((part) => part.text).join(" ");
+    }
+
+    async function sendA2AFromForm(evt) {
+      evt.preventDefault();
+      const text = $("a2aText").value.trim();
+      if (!text) return;
+      const button = $("a2aSend");
+      const status = $("a2aFormStatus");
+      button.disabled = true;
+      status.textContent = "Sending...";
+      try {
+        const res = await fetch("/a2a", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "ui-send-" + Date.now(),
+            method: "message/send",
+            params: {
+              message: {
+                kind: "message",
+                role: "user",
+                messageId: crypto.randomUUID(),
+                parts: [{ kind: "text", text }],
+              },
+              metadata: { source: "dashboard" },
+            },
+          }),
+        });
+        const rpc = await res.json();
+        if (rpc.error) throw new Error(rpc.error.message);
+        $("a2aText").value = "";
+        status.textContent = "Stored as memory";
+        selectedTaskId = rpc.result.id;
+        renderTask(rpc.result);
+        fetch("/api/status").then((r) => r.json()).then(render);
+      } catch (err) {
+        status.textContent = err.message || "Send failed";
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     function renderMarkdown(markdown) {
       const root = document.createElement("div");
       root.className = "markdown";
-      const lines = markdown.replace(/\r\n/g, "\n").split("\n");
+      const lines = markdown
+        .replaceAll(String.fromCharCode(13), "")
+        .split(String.fromCharCode(10));
       let inFrontmatter = lines[0] === "---";
       let inCode = false;
       let codeLines = [];
@@ -845,7 +1186,7 @@ function pageHtml(): string {
       }
       function flushCode() {
         const pre = document.createElement("pre");
-        pre.appendChild(textEl("code", codeLines.join("\n")));
+        pre.appendChild(textEl("code", codeLines.join(String.fromCharCode(10))));
         root.appendChild(pre);
         codeLines = [];
       }
@@ -872,18 +1213,18 @@ function pageHtml(): string {
           flushList();
           continue;
         }
-        const heading = line.match(/^(#{1,3})\s+(.+)$/);
-        if (heading) {
+        const headingLevel = headingPrefixLength(line);
+        if (headingLevel > 0) {
           flushParagraph();
           flushList();
-          root.appendChild(textEl("h" + heading[1].length, heading[2]));
+          root.appendChild(textEl("h" + headingLevel, line.slice(headingLevel + 1).trim()));
           continue;
         }
-        const item = line.match(/^[-*]\s+(.+)$/);
-        if (item) {
+        const trimmed = line.trimStart();
+        if ((trimmed.startsWith("- ") || trimmed.startsWith("* ")) && trimmed.length > 2) {
           flushParagraph();
           if (!list) list = document.createElement("ul");
-          list.appendChild(textEl("li", item[1]));
+          list.appendChild(textEl("li", trimmed.slice(2)));
           continue;
         }
         if (line.startsWith("> ")) {
@@ -900,7 +1241,35 @@ function pageHtml(): string {
       return root;
     }
 
-    fetch("/api/status").then((r) => r.json()).then(render);
+    function headingPrefixLength(line) {
+      if (line.startsWith("# ") && line.length > 2) return 1;
+      if (line.startsWith("## ") && line.length > 3) return 2;
+      if (line.startsWith("### ") && line.length > 4) return 3;
+      return 0;
+    }
+
+    window.addEventListener("error", (event) => {
+      setConnection("UI error", "offline");
+      $("mapSummary").textContent = event.message || "Dashboard script error";
+      const reader = $("reader");
+      clear(reader);
+      reader.appendChild(textEl("h3", "Dashboard error"));
+      reader.appendChild(textEl("p", event.message || "Unknown browser error", "reader-meta"));
+    });
+    window.addEventListener("unhandledrejection", (event) => {
+      setConnection("UI error", "offline");
+      $("mapSummary").textContent = event.reason?.message || "Dashboard async error";
+    });
+    fetch("/api/status")
+      .then((r) => {
+        if (!r.ok) throw new Error("/api/status " + r.status);
+        return r.json();
+      })
+      .then(render)
+      .catch((err) => {
+        setConnection("Offline", "offline");
+        $("mapSummary").textContent = err.message || "Unable to load status";
+      });
     const source = new EventSource("/events");
     source.addEventListener("status", (event) => render(JSON.parse(event.data)));
     source.addEventListener("event", (event) => {
@@ -911,6 +1280,13 @@ function pageHtml(): string {
     });
     source.onerror = () => setConnection("Reconnecting", "reconnecting");
     $("knowledgeMap").addEventListener("click", selectMapNode);
+    $("knowledgeMap").addEventListener("mousemove", hoverMapNode);
+    $("knowledgeMap").addEventListener("mouseleave", () => {
+      hoverUnitId = null;
+      $("knowledgeMap").style.cursor = "default";
+      if (lastState) scheduleGraph(lastState);
+    });
+    $("a2aForm").addEventListener("submit", sendA2AFromForm);
     window.addEventListener("resize", () => {
       if (lastState) scheduleGraph(lastState);
     });

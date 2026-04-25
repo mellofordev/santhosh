@@ -50,11 +50,12 @@ describe("dashboard events", () => {
         headers: 2,
         reads: 1,
         seeds: 1,
+        a2a: 1,
       }),
     ).toEqual({
       type: "agent",
       title: "Agent activity",
-      detail: "reviewed 2 announcements, saved 1 item, shared 1 item",
+      detail: "reviewed 2 announcements, saved 1 item, shared 1 item, completed 1 A2A exchange",
     });
 
     expect(
@@ -64,6 +65,7 @@ describe("dashboard events", () => {
         headers: 0,
         reads: 0,
         seeds: 0,
+        a2a: 0,
       }),
     ).toBeNull();
   });

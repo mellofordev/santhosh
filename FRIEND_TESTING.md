@@ -39,7 +39,37 @@ Leave it running for 5-10 minutes. If you have Claude Code or Codex on PATH, you
 2. Keep terminals open.
 3. Open `http://127.0.0.1:8732`.
 4. Confirm the graph shows peers and knowledge nodes.
-5. Click stored knowledge nodes to read the markdown messages.
+5. Wait for a scheduler tick. Nodes should exchange A2A `message/send` requests over libp2p.
+6. Click stored knowledge nodes to read the markdown messages.
+
+## A2A Smoke Test
+
+With `santhosh` running, send a local A2A message:
+
+```bash
+curl -s http://127.0.0.1:8732/a2a \
+  -H 'content-type: application/json' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "message/send",
+    "params": {
+      "message": {
+        "kind": "message",
+        "role": "user",
+        "messageId": "friend-test-1",
+        "parts": [{ "kind": "text", "text": "Testing A2A memory capture from a friend node." }]
+      }
+    }
+  }'
+```
+
+Expected result:
+
+- The response contains a completed A2A task.
+- The dashboard A2A Tasks panel shows the task.
+- The graph shows a new stored memory node.
+- Clicking the node shows the markdown artifact.
 
 LAN discovery uses mDNS, so this works best when everyone is on the same Wi-Fi and multicast is not blocked.
 
