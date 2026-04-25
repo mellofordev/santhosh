@@ -10,11 +10,15 @@ export class ClaudeCodeHarness implements Harness {
       ["claude", "-p", prompt, "--output-format", "text"],
       { stdout: "pipe", stderr: "pipe" },
     );
-    const [stdout, code] = await Promise.all([
+    const [stdout, stderr, code] = await Promise.all([
       new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
       proc.exited,
     ]);
-    if (code !== 0) throw new Error(`claude exited with code ${code}`);
+    if (code !== 0) {
+      const detail = (stderr.trim() || stdout.trim() || "(no output)").slice(0, 2000);
+      throw new Error(`claude exited with code ${code}: ${detail}`);
+    }
     try {
       return parseDecision(stdout);
     } catch (err) {
