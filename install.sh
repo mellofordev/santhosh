@@ -52,6 +52,7 @@ if [ ! -f "$SOURCE_DIR/packages/cli/src/index.ts" ]; then
   exit 1
 fi
 
+rm -f "$BUN_BIN/santhosh"
 cat > "$BUN_BIN/santhosh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
