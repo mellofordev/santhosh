@@ -38,8 +38,31 @@ fi
 
 # ── 3. install santhosh ───────────────────────────────────────────────────────
 header "Installing santhosh..."
+# Force a clean install: bun caches git deps and may skip re-installing if
+# the same SHA is already present, which leaves a broken state if a previous
+# install failed mid-way.
+rm -rf "$HOME/.bun/install/global/node_modules/santhosh" 2>/dev/null || true
 bun add -g "github:${REPO}"
-info "santhosh installed"
+
+# Verify the binary actually got linked.
+if [ ! -e "$BUN_BIN/santhosh" ]; then
+  warning "santhosh binary not found at $BUN_BIN/santhosh — installing dependencies in the package directory and re-linking..."
+  PKG_DIR="$HOME/.bun/install/global/node_modules/santhosh"
+  if [ -d "$PKG_DIR" ]; then
+    (cd "$PKG_DIR" && bun install --production --no-save 2>/dev/null || bun install)
+    # Re-create symlink manually (bin entry → packages/cli/src/index.ts)
+    mkdir -p "$BUN_BIN"
+    ln -sf "$PKG_DIR/packages/cli/src/index.ts" "$BUN_BIN/santhosh"
+    chmod +x "$PKG_DIR/packages/cli/src/index.ts" 2>/dev/null || true
+  fi
+fi
+
+if [ -e "$BUN_BIN/santhosh" ]; then
+  info "santhosh installed at $BUN_BIN/santhosh"
+else
+  warning "santhosh binary still missing — check the output above for errors"
+  exit 1
+fi
 
 # ── 4. add bun bin to PATH in the user's shell rc ────────────────────────────
 PATCHED_FILES=()

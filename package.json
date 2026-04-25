@@ -5,10 +5,9 @@
   "type": "module",
   "workspaces": ["packages/*"],
   "bin": {
-    "santhosh": "./dist/santhosh.js"
+    "santhosh": "./packages/cli/src/index.ts"
   },
   "scripts": {
-    "prepare": "bun build packages/cli/src/index.ts --outfile dist/santhosh.js --target bun",
     "dev": "bun run packages/cli/src/index.ts",
     "build": "bun build packages/cli/src/index.ts --outfile dist/santhosh.js --target bun",
     "test": "bun test"
